@@ -10,6 +10,9 @@ import resource
 import time
 import gevent
 
+# should be able to use sigaction(2) to marka set of signals with
+# SA_RESTART (so select gets auto restarted on sigchld)
+
 # ugh
 IGNORE_SIGS = ('SIGKILL', 'SIGSTOP', 'SIG_DFL', 'SIG_IGN')
 SIGNO_TO_NAME = {no: name for name, no in signal.__dict__.iteritems()
