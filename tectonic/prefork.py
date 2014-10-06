@@ -8,18 +8,18 @@ import select
 import sys
 import resource
 import time
-import gevent
+
 
 # should be able to use sigaction(2) to marka set of signals with
 # SA_RESTART (so select gets auto restarted on sigchld)
 
-# ugh
+
 IGNORE_SIGS = ('SIGKILL', 'SIGSTOP', 'SIG_DFL', 'SIG_IGN')
-SIGNO_TO_NAME = {no: name for name, no in signal.__dict__.iteritems()
-                 if name.startswith('SIG')
-                 and name not in IGNORE_SIGS}
-DEFAULT_SIGNAL_HANDLERS = {signo: signal.getsignal(signo)
-                           for signo in SIGNO_TO_NAME}
+SIGNO_TO_NAME = dict((no, name) for name, no in signal.__dict__.iteritems()
+                     if name.startswith('SIG')
+                     and name not in IGNORE_SIGS)
+DEFAULT_SIGNAL_HANDLERS = dict((signo, signal.getsignal(signo))
+                               for signo in SIGNO_TO_NAME)
 
 
 def set_nonblocking(*fds):
@@ -29,7 +29,12 @@ def set_nonblocking(*fds):
 
 
 def _ignore_interrupts(e):
-    en, _ = e.args
+    try:
+        en, _ = e.args
+    except ValueError:
+        # This can happen in certain cases where the error only
+        # has one piece
+        raise e
     if en not in (errno.EINTR, errno.EAGAIN):
         raise e
 
@@ -49,17 +54,6 @@ def restart_syscall(func, *args, **kwargs):
             _ignore_interrupts(e)
 
 
-class WriteAndFlushFile(file):
-
-    def write(self, str):
-        full = len(str) == os.write(self.fileno(), str)
-        self.flush()
-        return full
-
-    def writelines(self, sequence_of_strings):
-        return self.write(''.join(sequence_of_strings))
-
-
 class WorkerMetadata(object):
 
     def __init__(self, pid, health_check_read, last_seen):
@@ -77,14 +71,17 @@ class Master(object):
     PLATFORM_RSS_MULTIPLIER = 1
     PROC_FDS = '/proc/self/fd'
 
-    def __init__(self, server_class, socket_factory, sleep, wsgi, address,
-                 logpath, pidfile, num_workers=None):
+    def __init__(self, server_class, server_args_factory,
+                 socket_factory, sleep, wsgi, address,
+                 access_log_path, error_log_path, pidfile, num_workers=None):
         self.server_class = server_class
+        self.server_args_factory = server_args_factory
         self.socket_factory = socket_factory
         self.sleep = sleep
         self.wsgi = wsgi
         self.address = address
-        self.logpath = logpath
+        self.access_log_path = access_log_path
+        self.error_log_path = error_log_path
         self.pidfile = pidfile
 
         self.listener = None
@@ -99,12 +96,16 @@ class Master(object):
         self.pipe_to_workers[w.health_check_read] = w
 
     def remove_worker(self, w):
+        # we may have gotten interrupted by a signal
         if w:
             self.pid_to_workers.pop(w.pid, None)
             self.pipe_to_workers.pop(w.health_check_read, None)
 
-    def log(self):
-        self.logfile = WriteAndFlushFile(self.logpath, 'ab')
+    def open_log(self, path):
+        # for O_APPEND's atomicity to work across the children's
+        # stdout/err, the interpreter must be started with unbuffered
+        # stdio (-u or PYTHONUNBUFFERED)
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
 
     def bind(self):
         self.listener = self.socket_factory()
@@ -131,18 +132,20 @@ class Master(object):
         # 5 -- skip for now
         # os.chdir('/')
         # 6/7
-        for fd in xrange(3):
-            os.dup2(self.logfile.fileno(), fd)
+        fd = os.open('/dev/null', os.O_RDWR)
+        os.dup2(fd, 0)
+        os.dup2(self.open_log(self.access_log_path), 1)
+        os.dup2(self.open_log(self.error_log_path), 2)
 
         with open(self.pidfile, 'w') as f:
             f.write(str(os.getpid()))
 
     def health_check(self, fd_limit, maxrss_limit):
         # parent alive?
-        # if os.getppid() == 1:
-        #     # we were orphaned and adopted by init
-        #     sys.stderr.write('parent died!\n')
-        #     sys.exit(1)
+        if os.getppid() == 1:
+            # we were orphaned and adopted by init
+            sys.stderr.write('parent died!\n')
+            sys.exit(1)
         # memory usage?
         usage = resource.getrusage(resource.RUSAGE_SELF)
 
@@ -193,52 +196,52 @@ class Master(object):
             self.remove_worker(self.pid_to_workers.get(pid))
 
     def set_signal_handlers(self, signal_handlers):
-        return {signo: signal.signal(signo, handler)
-                for signo, handler in signal_handlers.iteritems()}
+        return dict((signo, signal.signal(signo, handler))
+                    for signo, handler in signal_handlers.iteritems())
 
-    def master_signals(self):
+    def install_signal_handlers(self):
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
 
-        def handler(signo, frame):
-            safe_syscall(os.write, self.pipe_signal, chr(signo))
-
-        handlers = self.set_signal_handlers({signo: handler
-                                             for signo, name
-                                             in SIGNO_TO_NAME.iteritems()})
-
-        return handlers
-
-    def handle_signals(self, signos):
-        for signo in signos:
-            signo = ord(signo)
-            handler_name = SIGNO_TO_NAME[signo] + '_handler'
-            handler_meth = getattr(self, handler_name, None)
-            if handler_meth:
-                # no frame, sorry
-                handler_meth(signo, None)
+        # for sig_chld:
+        # learned from twisted.internet._signals
+        def noop(*args):
+            pass
+        # don't run any handler..
+        signal.signal(signal.SIGCHLD, noop)
+        # ...and restart applicable system calls...
+        signal.siginterrupt(signal.SIGCHLD, False)
+        # ...and use set_wakeup_fd
+        signal.set_wakeup_fd(self.pipe_signal)
 
     def run(self, daemonize=True):
         self.bind()
 
         if daemonize:
-            self.log()
             self.daemonize()
 
         self.selfpipes()
-        self.master_signals()
+        self.install_signal_handlers()
 
-        self.server = self.server_class(self.listener, self.wsgi)
+        args, kwargs = self.server_args_factory()
+
+        args = (self.listener, self.wsgi) + args
+
+        self.server = self.server_class(*args, **kwargs)
         self.spawn_workers(self.num_workers)
 
         while True:
             read = [c.health_check_read for c in self.pid_to_workers.values()]
             read.append(self.pipe_select)
-            read, write, exc = restart_syscall(select.select, read, [], [],
-                                               self.SELECT_TIMEOUT)
+            read, write, exc = restart_syscall(
+                select.select,
+                read, [], [], self.SELECT_TIMEOUT)
+
             now = time.time()
 
             for r in read:
                 if r == self.pipe_select:
-                    self.handle_signals(os.read(r, 4096))
+                    self.reap()
                     continue
                 os.read(r, 4096)
                 worker = self.pipe_to_workers.get(r)
@@ -252,21 +255,18 @@ class Master(object):
             if self.num_workers > len(self.pid_to_workers):
                 self.spawn_workers(self.num_workers - len(self.pid_to_workers))
 
-    def SIGCLD_handler(self, signo, frame):
+    def reap(self):
         while True:
             try:
                 pid, status = os.waitpid(-1, os.WNOHANG)
                 if not pid:
                     break
-                # we may have gotten interrupted by another sigchld call!
                 self.remove_worker(self.pid_to_workers.get(pid))
             except OSError as e:
                 if e.errno == errno.ECHILD:
                     break
 
-    SIGCHLD_handler = SIGCLD_handler
-
-    def SIGTERM_handler(self, signo, frame):
+    def shutdown(self, *args, **kwargs):
         for child in self.pid_to_workers:
             try:
                 os.kill(child, signal.SIGTERM)
@@ -280,56 +280,3 @@ class Master(object):
                 if e.errno == errno.ECHILD:
                     break
         sys.exit(0)
-
-    SIGINT_handler = SIGTERM_handler
-
-
-if __name__ == '__main__':
-    import argparse
-    import gevent.pywsgi
-
-    a = argparse.ArgumentParser()
-    a.add_argument('address')
-    a.add_argument('port', type=int)
-    a.add_argument('--logpath', default='log')
-    a.add_argument('--pidfile', default='pidfile')
-    a.add_argument('--daemonize', '-d', default=False, action='store_true')
-
-    import string
-    chrs = string.lowercase[:Master.DEFAULT_NUM_WORKERS]
-
-    def wsgi(environ, start_response):
-        start_response('200 OK', [('Content-Type', 'text/html')])
-        pid = os.getpid()
-        spid = str(pid)
-        sys.stderr.write('''\
-Lorem ipsum dolor sit amet, consectetur adipiscing elit. Phasellus
-eleifend a metus quis sollicitudin. Aenean nec dolor iaculis, rhoncus
-turpis sit amet, interdum quam. Nunc rhoncus magna a leo interdum
-luctus. Vestibulum nec sapien diam. Aliquam rutrum venenatis
-mattis. Etiam eget adipiscing risus. Vestibulum ante ipsum primis in
-faucibus orci luctus et ultrices posuere cubilia Curae; Fusce nibh
-nulla, lacinia quis dignissim vel, condimentum at odio. Nunc et diam
-mauris. Fusce sit amet odio sagittis, convallis urna a, blandit
-urna. Phasellus mattis ligula sed tincidunt pellentesque. Nullam
-tempor convallis dapibus.
-
-Duis vitae vulputate sem, nec eleifend orci. Donec vel metus
-fringilla, ultricies nunc at, ultrices quam. Donec placerat nisi quis
-fringilla facilisis. Fusce eget erat ut magna consectetur
-elementum. Aenean non vulputate nulla. Aliquam eu dui nibh. Vivamus
-mollis suscipit neque, quis aliquam ipsum auctor non. Nulla cursus
-turpis turpis, nec euismod urna placerat at. Nunc id sapien
-nibh. Vestibulum condimentum luctus placerat. Donec vitae posuere
-arcu.''' + '\n')
-        return ['<html><body><h1>ok</h1><br/>from ' + spid]
-
-    args = a.parse_args()
-
-    Master(server_class=gevent.pywsgi.WSGIServer,
-           socket_factory=gevent.socket.socket,
-           sleep=gevent.sleep,
-           wsgi=wsgi,
-           address=(args.address, args.port),
-           logpath=args.logpath,
-           pidfile=args.pidfile).run(args.daemonize)
