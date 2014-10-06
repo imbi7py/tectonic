@@ -47,6 +47,7 @@ class Bureaucrat(object):
         self.passage_way = Passageway()
         self.sockets = {}
         self.channels = {}
+        self.conn_journal = []
 
     def bind(self, path=None):
         if path is None:
@@ -63,6 +64,18 @@ class Bureaucrat(object):
                 handler(client, request)
         except Exception:
             traceback.print_exc()
+
+    def _handle_WantConnection(self, client, request):
+        family, type, proto, host, port = request
+
+        sock = self.sockets.get(request)
+        if sock is None:
+            resp = messages.Failure(request)
+        else:
+            # TODO: connect the socket
+            resp = messages.HaveSocket(*request)
+        messages._sendall(client, resp)
+        self.passage_way.transfer(client, sock)
 
     def _handle_WantSocket(self, client, request):
         family, type, proto, host, port = request
